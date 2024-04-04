@@ -1,13 +1,17 @@
 import requests
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 # Starting location for the drive - replace with actual coordinates
 starting_latitude = 37.220511654446234
 starting_longitude = -76.62429314439137
 
 # Filter out any locations where cloud coverage is greater than this value
-cloud_coverage_filter = 30 
+cloud_coverage_filter = 10 
+
+# Date of eclipse
+date_str = "2024-04-08"
 
 def parse_latitude(lat):
     """Parses a latitude string with format 'degrees minutes direction' into a floating-point number in decimal degrees."""
@@ -49,51 +53,61 @@ def fetch_weather_forecast(latitude, longitude):
     return response.json()
 
 class WeatherForecast:
-    def __init__(self, time_utc, temperature, cloud_coverage, precipitation_probability):
-        self.time_utc = time_utc
+    def __init__(self, forecast_time_str, temperature, cloud_coverage, precipitation_probability):
+        self.forecast_time_str = forecast_time_str
         self.temperature = temperature
         self.cloud_coverage = cloud_coverage
         self.precipitation_probability = precipitation_probability
 
     def __repr__(self):
-        return (f"WeatherForecast(time_utc='{self.time_utc}', temperature={self.temperature}, "
+        # Parse the string to a datetime object assuming it's in UTC
+        utc_time_obj = datetime.strptime(self.forecast_time_str, "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc)
+        # Convert UTC datetime to local time
+        # might need to install tzdata ('pip install tzdata')
+        local_time_obj = utc_time_obj.astimezone(ZoneInfo("America/New_York"))
+        # Format it to 'YYYY-MM-DD HH:MM AM/PM' format
+        formatted_time_str = local_time_obj.strftime("%Y-%m-%d %I:%M %p %Z")
+        return (f"WeatherForecast(time='{formatted_time_str}', temperature={self.temperature}, "
                 f"cloud_coverage={self.cloud_coverage}, precipitation_probability={self.precipitation_probability})")
 
-def create_comparable_time(date_str, time_utc):
-    # Assuming date_str is in the format 'YYYY-MM-DD' (e.g., '2024-04-08')
-    # and time_utc is in the format 'HH:MM' (e.g., '16:42')
-    
-    # Combine the date and time strings into a single datetime object
-    combined_str = f"{date_str}T{time_utc}"
-    comparable_time = datetime.strptime(combined_str, "%Y-%m-%dT%H:%M")
-    
-    return comparable_time
 
-def find_closest_forecast_index(forecast_times, target_time):
-    # Convert all forecast times to datetime objects
-    forecast_datetimes = [datetime.strptime(time, "%Y-%m-%dT%H:%M") for time in forecast_times]
+def find_nearest_forecast_index(forecast_data, event_datetime):
+    """Find the index of the forecast nearest to the specified event datetime."""
+    forecast_times = forecast_data['time']
+    # Convert forecast times to datetime objects
+    forecast_datetimes = [datetime.strptime(time, "%Y-%m-%dT%H:%M").replace(tzinfo=event_datetime.tzinfo) for time in forecast_times]
     
-    # Find the index of the forecast time closest to the target time
-    closest_index, _ = min(enumerate(forecast_datetimes), key=lambda x: abs(x[1] - target_time))
+    # Ensure event_datetime is within the range of forecast times
+    if not (forecast_datetimes[0] <= event_datetime <= forecast_datetimes[-1]):
+        raise ValueError(f"Event datetime {event_datetime} is out of the forecast data range.")
+    
+    # Find the index of the forecast time closest to the event datetime
+    closest_index = min(range(len(forecast_datetimes)), key=lambda i: abs(forecast_datetimes[i] - event_datetime))
     
     return closest_index
 
-def parse_weather_response(weather_data, time_utc):
+def create_event_datetime(time_str):
+    """Creates a UTC datetime object from date and time strings."""
+    combined_str = f"{date_str}T{time_str}"
+    event_datetime = datetime.strptime(combined_str, "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc)
+    return event_datetime
+
+def parse_weather_response(weather_data, time_str):
     forecast_data = weather_data['hourly']
-    
-    # Get eclipse time in date time format
-    comparable_time = create_comparable_time("2024-04-08", time_utc)
-    i = find_closest_forecast_index(forecast_data['time'], comparable_time)  # index of the closest forecast time to eclipse time
-    
+    # Convert totality event time to datetime
+    event_datetime = create_event_datetime(time_str)
+     # Find the index of the nearest forecast time
+    i = find_nearest_forecast_index(weather_data['hourly'], event_datetime)
+
+    # Extract the weather data for the closest time
+    forecast_time_str = forecast_data['time'][i]  # response looks like '2024-04-03T01:00' or '2024-04-03T09:00
     temperature = forecast_data['temperature_2m'][i]
     cloud_coverage = forecast_data['cloud_cover'][i]
     precipitation_probability = forecast_data['precipitation_probability'][i]
-    
-    # Create a WeatherForecast object with the weather information
-    forecast = WeatherForecast(time_utc, temperature, cloud_coverage, precipitation_probability)
-    
-    return forecast
 
+    # Create a WeatherForecast object with the weather information
+    forecast = WeatherForecast(forecast_time_str, temperature, cloud_coverage, precipitation_probability)
+    return forecast
 
 def generate_google_maps_directions_url(origin, destination):
     origin_str = f"{origin[0]},{origin[1]}"
@@ -128,8 +142,10 @@ data = """
 19:52	49	41.3N	35	27.0W	48	24.7N	38	48.5W	49	03.9N	037	15.7W	1.043		12	268	153	02m28.2s
 """
 
-
-def parse_data_lines(data):
+# startIndex = 1 for northern limit
+# startIndex = 5 for southern limit
+# startIndex = 9 for central line
+def parse_data_lines(data, startIndex = 5):
     """
     Generator to yield the universal standard time and the third set of latitude and longitude coordinates from each line of data.
     Each line of data is expected to have multiple columns separated by tabs. Using the Central Line coordinates.
@@ -139,27 +155,46 @@ def parse_data_lines(data):
         parts = line.split("\t")
         time_utc = parts[0]
         # Using central line coordinates
-        latDeg = parts[5]
-        latMin = parts[6]
-        longDeg = parts[7]
-        longMin = parts[8]
+      
+        # startIndex = 5 for 5/6/7/8 for southern limit
+        # startIndex = 9 for 9/10/11/12 for central line
+        startIndex = 5
+        latDeg =  parts[startIndex]
+        latMin =  parts[startIndex + 1]
+        longDeg = parts[startIndex + 2]
+        longMin = parts[startIndex + 3]
 
         lat = " ".join([latDeg, latMin])   
         lng = " ".join([longDeg, longMin])
         yield time_utc, lat, lng
 
 
-def main():
-    for time_utc, lat, lng in parse_data_lines(data):
-        latitude, longitude = parse_latitude(lat), parse_longitude(lng)
-        weather_response = fetch_weather_forecast(latitude, longitude)
-        weather_forecast = parse_weather_response(weather_response, time_utc)
-        print(f"Forecast for ({latitude}, {longitude}): {weather_forecast}%")
+def open_directions_if_clear(forecast, coords):
+    # Opens Google Maps directions in a web browser if the cloud coverage for coordinate is less than specified filter
+    if forecast.cloud_coverage < cloud_coverage_filter:
+        directions_url = generate_google_maps_directions_url((starting_latitude, starting_longitude), coords)
+        print(f"Google Maps URL: {directions_url}\n")
+        webbrowser.open_new_tab(directions_url)
 
-        if (weather_forecast.cloud_coverage < cloud_coverage_filter):
-            directions_url = generate_google_maps_directions_url((starting_latitude, starting_longitude), (latitude, longitude))
-            print(f"Google Maps URL: {directions_url}\n")
-            webbrowser.open_new_tab(directions_url)
+def main():
+    southernPoints = parse_data_lines(data, 5)
+    centerPoints = parse_data_lines(data, 9)
+    combinedData = zip(southernPoints, centerPoints)
+    
+    for (time_utc_s, lat_s, lng_s), (_, lat_c, lng_c) in combinedData:
+        # Process southern point
+        latitude_s, longitude_s = parse_latitude(lat_s), parse_longitude(lng_s)
+        weather_response_s = fetch_weather_forecast(latitude_s, longitude_s)
+        weather_forecast_s = parse_weather_response(weather_response_s, time_utc_s)
+        print(f"Southern Point Forecast for ({latitude_s}, {longitude_s}): {weather_forecast_s}")
+        open_directions_if_clear(weather_forecast_s, (latitude_s, longitude_s))
+
+        # Process center point
+        latitude_c, longitude_c = parse_latitude(lat_c), parse_longitude(lng_c)
+        weather_response_c = fetch_weather_forecast(latitude_c, longitude_c)
+        weather_forecast_c = parse_weather_response(weather_response_c, time_utc_s)
+        print(f"Center Point Forecast for ({latitude_c}, {longitude_c}): {weather_forecast_c}")
+        open_directions_if_clear(weather_forecast_c, (latitude_c, longitude_c))
 
 if __name__ == "__main__":
     main()
